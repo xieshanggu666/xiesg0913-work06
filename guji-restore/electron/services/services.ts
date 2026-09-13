@@ -31,6 +31,7 @@ import { INITIAL_PLAN_VERSION, LAYER_KIND_META } from '@shared/constants';
 import {
   batchLedger,
   batchRemaining,
+  checkBatchNo,
   checkIssue,
   checkReturn,
   issueOutstanding,
@@ -571,13 +572,10 @@ export function createBatch(ctx: ServiceContext, input: NewBatchInput): Material
   const qty = Number(input.initial_qty);
   if (!Number.isFinite(qty) || qty <= 0) throw new Error('入库数量必须大于 0');
   const no = input.batch_no.trim();
-  if (!no) throw new Error('请填写批次号');
   const unit = input.unit.trim();
   if (!unit) throw new Error('请填写计量单位');
-  const duplicate = repo
-    .listBatches(lib, input.material_id)
-    .some((b) => b.batch_no.trim().toLocaleLowerCase() === no.toLocaleLowerCase());
-  if (duplicate) throw new Error(`该材料已存在批次号「${no}」`);
+  const dupErr = checkBatchNo(no, repo.listBatches(lib), input.material_id);
+  if (dupErr) throw new Error(dupErr);
   const ts = nowIso();
   const batch: MaterialBatch = {
     id: newId('bat_'),
@@ -599,10 +597,18 @@ export function updateBatch(
   id: ID,
   patch: Partial<Pick<MaterialBatch, 'batch_no' | 'supplier_lot' | 'received_at' | 'note'>>
 ): MaterialBatch {
+  const lib = ctx.library();
+  const cur = repo.getBatch(lib, id);
+  if (!cur) throw new Error(`批次不存在: ${id}`);
   const clean: typeof patch = { ...patch };
   if (clean.received_at) clean.received_at = normalizeDate(clean.received_at);
-  if (clean.batch_no !== undefined) clean.batch_no = clean.batch_no.trim();
-  return repo.updateBatchRow(ctx.library(), id, clean);
+  if (clean.batch_no !== undefined) {
+    clean.batch_no = clean.batch_no.trim();
+    // 批次号不允许改成空，也不允许与同一材料的其它批次重复
+    const dupErr = checkBatchNo(clean.batch_no, repo.listBatches(lib), cur.material_id, id);
+    if (dupErr) throw new Error(dupErr);
+  }
+  return repo.updateBatchRow(lib, id, clean);
 }
 
 export function removeBatch(ctx: ServiceContext, id: ID): void {

@@ -22,6 +22,27 @@ export function formatQty(n: number): string {
   return String(roundQty(n));
 }
 
+/**
+ * 批次号校验：非空且同一材料下唯一（编辑时传 excludeId 排除自身）。
+ * 批次号比较忽略首尾空白与大小写。返回错误信息，合法为 null。
+ */
+export function checkBatchNo(
+  rawNo: string,
+  batches: Pick<MaterialBatch, 'id' | 'material_id' | 'batch_no'>[],
+  materialId: ID,
+  excludeId?: ID
+): string | null {
+  const no = (rawNo ?? '').trim();
+  if (!no) return '请填写批次号';
+  const dup = batches.some(
+    (b) =>
+      b.material_id === materialId &&
+      b.id !== excludeId &&
+      b.batch_no.trim().toLocaleLowerCase() === no.toLocaleLowerCase()
+  );
+  return dup ? `该材料已存在批次号「${no}」` : null;
+}
+
 /** 批次的全部流水（含由批次合成的入库记录），按发生时间升序 */
 export function batchLedger(batch: MaterialBatch, movements: StockMovement[]): StockMovement[] {
   const inbound: StockMovement = {

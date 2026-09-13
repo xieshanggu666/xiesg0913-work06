@@ -4,6 +4,7 @@ import {
   batchLedger,
   batchLinkedStepIds,
   batchRemaining,
+  checkBatchNo,
   checkIssue,
   checkReturn,
   issueOutstanding,
@@ -137,5 +138,39 @@ describe('库存纯函数', () => {
       move({ id: 'r1', kind: 'return', step_id: 's1', related_move_id: 'i1' })
     ];
     expect(batchLinkedStepIds('bat_1', moves)).toEqual(['s1', 's2']);
+  });
+
+  describe('checkBatchNo 批次号唯一校验', () => {
+    const batches: MaterialBatch[] = [
+      batch({ id: 'b1', material_id: 'm1', batch_no: '2026-A-01' }),
+      batch({ id: 'b2', material_id: 'm1', batch_no: '2026-B-07' }),
+      batch({ id: 'b3', material_id: 'm2', batch_no: '2026-A-01' })
+    ];
+
+    it('空批次号被拒绝', () => {
+      expect(checkBatchNo('   ', batches, 'm1')).toMatch(/请填写批次号/);
+    });
+
+    it('同一材料下批次号重复（忽略大小写/空白）被拒绝', () => {
+      expect(checkBatchNo(' 2026-a-01 ', batches, 'm1')).toMatch(/已存在批次号/);
+    });
+
+    it('不同材料允许相同批次号', () => {
+      expect(checkBatchNo('2026-A-01', batches, 'm9')).toBeNull();
+    });
+
+    it('同一材料下不重复的批次号通过', () => {
+      expect(checkBatchNo('2026-C-99', batches, 'm1')).toBeNull();
+    });
+
+    it('编辑自身时传入 excludeId 排除当前批次：改成自己的号允许', () => {
+      expect(checkBatchNo('2026-a-01', batches, 'm1', 'b1')).toBeNull();
+    });
+
+    it('编辑时改成同材料其它批次的号仍被拒绝', () => {
+      expect(checkBatchNo('2026-b-07', batches, 'm1', 'b1')).toMatch(/已存在批次号/);
+      // 排除 id 不属于该材料不影响查重
+      expect(checkBatchNo('2026-B-07', batches, 'm1', 'b3')).toMatch(/已存在批次号/);
+    });
   });
 });

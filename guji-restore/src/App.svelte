@@ -19,7 +19,7 @@
     stepIssuesMap,
     type ViewKey
   } from './lib/stores';
-  import { guard, toast } from './lib/toast';
+  import { guard, toast, toasts } from './lib/toast';
   import Modal from './components/Modal.svelte';
   import ProjectForm from './components/ProjectForm.svelte';
   import ProjectSidebar from './components/ProjectSidebar.svelte';
@@ -208,6 +208,14 @@
 
 {#if showComments}
   <CommentsPanel on:close={() => (showComments = false)} />
+{/if}
+
+{#if $toasts.length}
+  <div class="toast-host">
+    {#each $toasts as t (t.id)}
+      <div class="toast" class:error={t.kind === 'error'}>{t.text}</div>
+    {/each}
+  </div>
 {/if}
 
 <style>

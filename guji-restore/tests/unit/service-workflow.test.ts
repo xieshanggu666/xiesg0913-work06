@@ -429,6 +429,17 @@ describe('主进程工作流（SQLite + sharp + zip）', () => {
     const emptyBatch = s.createBatch(ctx, {
       material_id: mat.id, batch_no: '2026-Z-99', unit: '张', initial_qty: 5, received_at: '2026-09-05'
     });
+
+    // 编辑批次号：改成同材料已存在的号（忽略大小写）被拒绝；改成空被拒绝
+    expect(() => s.updateBatch(ctx, batch.id, { batch_no: '2026-z-99' })).toThrow(/已存在批次号/);
+    expect(() => s.updateBatch(ctx, batch.id, { batch_no: '   ' })).toThrow(/请填写批次号/);
+    // 批次号未被改动（仍是 2026-A-01）
+    expect(s.getBatchDetail(ctx, batch.id).batch.batch_no).toBe('2026-A-01');
+    // 改成不冲突的新号成功；改成自己的号（幂等）也成功
+    s.updateBatch(ctx, batch.id, { batch_no: '2026-A-02' });
+    expect(s.getBatchDetail(ctx, batch.id).batch.batch_no).toBe('2026-A-02');
+    expect(() => s.updateBatch(ctx, batch.id, { batch_no: '2026-a-02' })).not.toThrow();
+
     s.removeBatch(ctx, emptyBatch.id);
     expect(s.listBatches(ctx, mat.id).some((b) => b.id === emptyBatch.id)).toBe(false);
     // 被批次引用的材料不能删除

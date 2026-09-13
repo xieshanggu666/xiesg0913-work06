@@ -117,3 +117,42 @@ test('材料库卡片可跳转登记批次并带入材料', async ({ page }) => 
   await expect(page.getByRole('heading', { name: '登记入库批次' })).toBeVisible();
   await expect(page.getByRole('heading', { name: '材料领用与批次追溯' })).toBeVisible();
 });
+
+test('编辑批次号：改成同材料已存在的号或空号被阻止，原值保留', async ({ page }) => {
+  await page.getByRole('button', { name: '载入样例' }).click();
+  await expect(page.getByText('《稼轩长短句》样卷')).toBeVisible({ timeout: 10_000 });
+  await page.getByRole('button', { name: '材料领用' }).click();
+
+  // 在同一种材料（净皮棉连）下登记两个批次
+  async function register(no: string) {
+    await page.getByRole('button', { name: '＋ 登记批次' }).click();
+    const m = page.locator('.modal');
+    await m.getByPlaceholder('如 2026-A-01').fill(no);
+    await m.locator('input[type="number"]').first().fill('10');
+    await m.getByRole('button', { name: '保存' }).click();
+    await expect(m).toHaveCount(0);
+    await expect(page.getByText(no).first()).toBeVisible();
+  }
+  await register('DUP-01');
+  await register('DUP-02');
+
+  // 把 DUP-02 编辑为 DUP-01（同材料重复）→ 保存失败、弹窗保留
+  const row = page.locator('tr').filter({ hasText: 'DUP-02' });
+  await row.getByRole('button', { name: '编辑' }).click();
+  const modal = page.locator('.modal');
+  await expect(modal.getByRole('heading', { name: '编辑批次' })).toBeVisible();
+  await modal.getByPlaceholder('如 2026-A-01').fill('DUP-01');
+  await modal.getByRole('button', { name: '保存' }).click();
+  await expect(page.locator('.toast.error').filter({ hasText: '已存在批次号' })).toBeVisible({ timeout: 5000 });
+  // 弹窗仍在，取消后两个批次号都保留
+  await modal.getByRole('button', { name: '取消' }).click();
+  await expect(page.getByText('DUP-01').first()).toBeVisible();
+  await expect(page.getByText('DUP-02').first()).toBeVisible();
+
+  // 改成空白批次号同样被阻止
+  await row.getByRole('button', { name: '编辑' }).click();
+  await modal.getByPlaceholder('如 2026-A-01').fill('   ');
+  await modal.getByRole('button', { name: '保存' }).click();
+  await expect(page.locator('.toast.error').filter({ hasText: '请填写批次号' })).toBeVisible({ timeout: 5000 });
+  await modal.getByRole('button', { name: '取消' }).click();
+});

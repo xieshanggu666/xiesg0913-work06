@@ -10,6 +10,7 @@ import { buildExportPreview } from '@shared/export-preview';
 import {
   batchLedger,
   batchRemaining,
+  checkBatchNo,
   checkIssue,
   checkReturn,
   issueOutstanding,
@@ -61,6 +62,14 @@ function createMockApi(): GujiApi {
   db.media ||= {};
 
   const asyncify = async <T,>(v: T): Promise<T> => {
+    save();
+    await new Promise((r) => setTimeout(r, 4));
+    return v;
+  };
+  // 同 asyncify，但接受 thunk：thunk 内同步抛错（如查重失败）也会被 Promise 拒绝，
+  // 避免 asyncify((() => { throw })()) 在入参求值阶段就把错误抛出、guard 的 await 捕获不到。
+  const run = async <T,>(fn: () => T): Promise<T> => {
+    const v = fn();
     save();
     await new Promise((r) => setTimeout(r, 4));
     return v;
@@ -541,18 +550,16 @@ function createMockApi(): GujiApi {
           })()
         ),
       createBatch: async (input) =>
-        asyncify((() => {
+        run(() => {
           const mat = db.materials.find((x: Row) => x.id === input.material_id);
           if (!mat) throw new Error(`材料不存在: ${input.material_id}`);
           const qty = Number(input.initial_qty);
           if (!Number.isFinite(qty) || qty <= 0) throw new Error('入库数量必须大于 0');
-          const no = (input.batch_no || '').trim();
-          if (!no) throw new Error('请填写批次号');
           const unit = (input.unit || '').trim();
           if (!unit) throw new Error('请填写计量单位');
-          if (db.batches.some((b: Row) => b.material_id === input.material_id && b.batch_no.trim().toLocaleLowerCase() === no.toLocaleLowerCase())) {
-            throw new Error(`该材料已存在批次号「${no}」`);
-          }
+          const dupErr = checkBatchNo(input.batch_no, db.batches as MaterialBatch[], input.material_id);
+          if (dupErr) throw new Error(dupErr);
+          const no = (input.batch_no || '').trim();
           const b = {
             id: uid('bat_'), material_id: input.material_id, batch_no: no, unit,
             initial_qty: roundQty(qty), supplier_lot: input.supplier_lot?.trim() ?? '',
@@ -561,19 +568,28 @@ function createMockApi(): GujiApi {
           };
           db.batches.push(b);
           return b;
-        })()),
+        }),
       updateBatch: async (id, patch) =>
-        asyncify(Object.assign(db.batches.find((b: Row) => b.id === id)!, patch)),
-      removeBatch: async (id) => {
-        if (!db.batches.some((b: Row) => b.id === id)) throw new Error(`批次不存在: ${id}`);
-        if (db.stockMovements.some((m: Row) => m.batch_id === id)) {
-          throw new Error('该批次已有领用或退料记录，不能删除（台账只追加、保持可追溯）');
-        }
-        db.batches = db.batches.filter((b: Row) => b.id !== id);
-        return asyncify(undefined as any);
-      },
+        run(() => {
+          const b = db.batches.find((x: Row) => x.id === id);
+          if (!b) throw new Error(`批次不存在: ${id}`);
+          if (patch.batch_no !== undefined) {
+            const dupErr = checkBatchNo(patch.batch_no, db.batches as MaterialBatch[], b.material_id, id);
+            if (dupErr) throw new Error(dupErr);
+            patch = { ...patch, batch_no: patch.batch_no.trim() };
+          }
+          return Object.assign(b, patch);
+        }),
+      removeBatch: async (id) =>
+        run(() => {
+          if (!db.batches.some((b: Row) => b.id === id)) throw new Error(`批次不存在: ${id}`);
+          if (db.stockMovements.some((m: Row) => m.batch_id === id)) {
+            throw new Error('该批次已有领用或退料记录，不能删除（台账只追加、保持可追溯）');
+          }
+          db.batches = db.batches.filter((b: Row) => b.id !== id);
+        }),
       issue: async (input) =>
-        asyncify((() => {
+        run(() => {
           const b = db.batches.find((x: Row) => x.id === input.batch_id);
           if (!b) throw new Error(`批次不存在: ${input.batch_id}`);
           if (!input.project_id) throw new Error('领料必须指定项目');
@@ -592,9 +608,9 @@ function createMockApi(): GujiApi {
           db.stockMovements.push(m);
           touchProject(input.project_id);
           return m;
-        })()),
+        }),
       returnToStock: async (input) =>
-        asyncify((() => {
+        run(() => {
           const source = db.stockMovements.find((m: Row) => m.id === input.source_move_id);
           if (!source || source.kind !== 'issue') throw new Error('只能针对领料记录退料');
           const b = db.batches.find((x: Row) => x.id === source.batch_id);
@@ -611,7 +627,7 @@ function createMockApi(): GujiApi {
           db.stockMovements.push(m);
           touchProject(source.project_id);
           return m;
-        })()),
+        }),
       stepIssues: async (stepId) =>
         asyncify(
           db.stockMovements
