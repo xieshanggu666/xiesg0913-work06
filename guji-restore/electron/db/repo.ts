@@ -7,12 +7,14 @@ import type {
   LabColor,
   Layer,
   Material,
+  MaterialBatch,
   PlanSnapshot,
   PlanVersion,
   Project,
   RestorationStep,
   Sample,
-  Shape
+  Shape,
+  StockMovement
 } from '@shared/types';
 
 type DB = Database.Database;
@@ -171,6 +173,107 @@ export function updateMaterialRow(db: DB, id: string, patch: Partial<Material>):
 
 export function deleteMaterialRow(db: DB, id: string): void {
   db.prepare('DELETE FROM materials WHERE id = ?').run(id);
+}
+
+/* ---------------- 材料批次与领用流水（全局库） ---------------- */
+
+export function batchRow(r: any): MaterialBatch {
+  return {
+    id: r.id,
+    material_id: r.material_id,
+    batch_no: r.batch_no,
+    unit: r.unit,
+    initial_qty: r.initial_qty,
+    supplier_lot: r.supplier_lot,
+    received_at: r.received_at,
+    note: r.note,
+    created_at: r.created_at
+  };
+}
+
+export function insertBatch(db: DB, b: MaterialBatch): void {
+  db.prepare(
+    `INSERT INTO material_batches (id, material_id, batch_no, unit, initial_qty, supplier_lot, received_at, note, created_at)
+     VALUES (@id,@material_id,@batch_no,@unit,@initial_qty,@supplier_lot,@received_at,@note,@created_at)`
+  ).run(b);
+}
+
+export function listBatches(db: DB, materialId?: string): MaterialBatch[] {
+  const rows = materialId
+    ? db.prepare('SELECT * FROM material_batches WHERE material_id = ? ORDER BY received_at DESC, created_at DESC').all(materialId)
+    : db.prepare('SELECT * FROM material_batches ORDER BY received_at DESC, created_at DESC').all();
+  return rows.map(batchRow);
+}
+
+export function getBatch(db: DB, id: string): MaterialBatch | null {
+  const r = db.prepare('SELECT * FROM material_batches WHERE id = ?').get(id);
+  return r ? batchRow(r) : null;
+}
+
+/** 批次元信息可改；入库数量不在此修改（库存以流水留痕） */
+export function updateBatchRow(
+  db: DB,
+  id: string,
+  patch: Partial<Pick<MaterialBatch, 'batch_no' | 'supplier_lot' | 'received_at' | 'note'>>
+): MaterialBatch {
+  const cur = getBatch(db, id);
+  if (!cur) throw new Error(`批次不存在: ${id}`);
+  const next: MaterialBatch = { ...cur, ...patch, id };
+  db.prepare(
+    `UPDATE material_batches SET batch_no=@batch_no, supplier_lot=@supplier_lot,
+       received_at=@received_at, note=@note WHERE id=@id`
+  ).run(next);
+  return next;
+}
+
+export function deleteBatchRow(db: DB, id: string): void {
+  db.prepare('DELETE FROM material_batches WHERE id = ?').run(id);
+}
+
+export function countMovementsOfBatch(db: DB, batchId: string): number {
+  return (db.prepare('SELECT COUNT(*) AS n FROM stock_movements WHERE batch_id = ?').get(batchId) as any).n as number;
+}
+
+export function movementRow(r: any): StockMovement {
+  return { ...r };
+}
+
+export function insertMovement(db: DB, m: StockMovement): void {
+  db.prepare(
+    `INSERT INTO stock_movements (id, batch_id, kind, qty, project_id, step_id, operator, moved_at, note, related_move_id, created_at)
+     VALUES (@id,@batch_id,@kind,@qty,@project_id,@step_id,@operator,@moved_at,@note,@related_move_id,@created_at)`
+  ).run({
+    ...m,
+    project_id: m.project_id ?? null,
+    step_id: m.step_id ?? null,
+    related_move_id: m.related_move_id ?? null
+  });
+}
+
+export function getMovement(db: DB, id: string): StockMovement | null {
+  const r = db.prepare('SELECT * FROM stock_movements WHERE id = ?').get(id);
+  return r ? movementRow(r) : null;
+}
+
+export function listMovements(db: DB): StockMovement[] {
+  return db.prepare('SELECT * FROM stock_movements ORDER BY moved_at, created_at').all().map(movementRow);
+}
+
+export function listMovementsByProject(db: DB, projectId: string): StockMovement[] {
+  return db
+    .prepare('SELECT * FROM stock_movements WHERE project_id = ? ORDER BY moved_at, created_at')
+    .all(projectId)
+    .map(movementRow);
+}
+
+/** 删除工序时：其领料流水保留可追溯，但解除工序引用（转为整卷领用） */
+export function detachMovementsFromStep(db: DB, stepId: string): void {
+  db.prepare('UPDATE stock_movements SET step_id = NULL WHERE step_id = ?').run(stepId);
+}
+
+/** 删除项目时：移除该项目的领用/退料流水并回滚批次余量（批次本身是全局资源，仍保留） */
+export function deleteMovementsByProject(db: DB, projectId: string): void {
+  db.prepare('DELETE FROM stock_movements WHERE project_id = ?').run(projectId);
 }
 
 /* ---------------- 项目库 ---------------- */

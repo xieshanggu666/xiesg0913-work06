@@ -4,8 +4,18 @@
  *  - 浏览器 / Playwright：使用同构内存 Mock（localStorage 持久化），并把图片指向 /samples
  */
 import type { GujiApi } from '@shared/protocol';
+import type { MaterialBatch, StockMovement } from '@shared/types';
 import { buildDashboard } from '@shared/dashboard';
 import { buildExportPreview } from '@shared/export-preview';
+import {
+  batchLedger,
+  batchRemaining,
+  checkIssue,
+  checkReturn,
+  issueOutstanding,
+  makeMovement,
+  roundQty
+} from '@shared/inventory';
 
 export const api: GujiApi =
   typeof window !== 'undefined' && window.guji
@@ -45,6 +55,8 @@ function createMockApi(): GujiApi {
   db.versions ||= [];
   db.comments ||= [];
   db.exportRecords ||= [];
+  db.batches ||= [];
+  db.stockMovements ||= [];
   // 上传媒体内容表：rel -> data URL（浏览器拿不到真实文件系统，上传内容随 mock 库持久化）
   db.media ||= {};
 
@@ -80,6 +92,8 @@ function createMockApi(): GujiApi {
         weave: '帘纹细，吸水性：中', ph, supplier: '内置示例', note: '', created_at: now(), updated_at: now()
       }));
     }
+    // 批次/领用演示数据在“载入样例”时随样例项目登记（见 importSamples），
+    // 空库不预置批次，避免在未建项目时出现无主库存。
     if (db.samples.length === 0) {
       db.samples = [
         { kind: 'paper', name: '样卷原纸（叶心）', source: '第二叶叶心无墨处', color_hex: '#e7dcc0', fiber: '竹浆约 70% / 皮料 30%', grain: '竖帘纹', thickness_mm: 0.09, absorbency: '中' },
@@ -197,20 +211,41 @@ function createMockApi(): GujiApi {
         addShape(dmgLayer.id, 'wormhole', { type: 'ellipse', x: 560, y: 520, w: 30, h: 26 }, '虫孔 B');
         addShape(dmgLayer.id, 'tear', { type: 'polygon', points: [{ x: 130, y: 160 }, { x: 310, y: 190 }, { x: 320, y: 212 }, { x: 140, y: 184 }] }, '横向撕裂');
         addShape(repLayer.id, 'wormhole', { type: 'ellipse', x: 426, y: 246, w: 54, h: 46 }, '拟用净皮棉连嵌补');
-        const mian = db.materials.find((m: Row) => m.name.includes('棉连'));
+        const mian = db.materials.find((m: Row) => m.name.includes('净皮棉连'));
+        let buchongStepId = '';
         [
           { title: '拍照建档与试色', technique: '记录', duration: 30 },
           { title: '干揭分离叶面', technique: '干揭', duration: 45 },
           { title: '虫孔嵌补', technique: '补洞', duration: 90 },
           { title: '整叶托裱压平', technique: '托裱', duration: 60 }
         ].forEach((st, i) => {
+          const stepId = uid('stp_');
+          if (st.title === '虫孔嵌补') buchongStepId = stepId;
           db.steps.push({
-            id: uid('stp_'), project_id: p.id, folio_id: folios[2].id, order_index: i + 1,
+            id: stepId, project_id: p.id, folio_id: folios[2].id, order_index: i + 1,
             title: st.title, technique: st.technique, material_ids: st.title === '虫孔嵌补' && mian ? [mian.id] : [],
             operator: '示例修复', performed_at: now().slice(0, 10), duration_min: st.duration,
             photo_rel: null, note: '', created_at: now()
           });
         });
+        // 样例库存：净皮棉连登记批次 50 张，虫孔嵌补领料 6 张（演示选材→批次→工序追溯）
+        if (mian && !db.batches.some((b: Row) => b.material_id === mian.id)) {
+          const demoBatch = {
+            id: uid('bat_'), material_id: mian.id, batch_no: '2026-A-01', unit: '张',
+            initial_qty: 50, supplier_lot: '泾县宣纸厂 / 入厂批号 2603',
+            received_at: now().slice(0, 10), note: '内置示例批次', created_at: now()
+          };
+          db.batches.push(demoBatch);
+          if (buchongStepId) {
+            db.stockMovements.push(
+              makeMovement({
+                id: uid('mv_'), batch_id: demoBatch.id, kind: 'issue', qty: 6,
+                project_id: p.id, step_id: buchongStepId, operator: '示例修复',
+                moved_at: now().slice(0, 10), note: '虫孔群嵌补领纸', created_at: now()
+              })
+            );
+          }
+        }
         db.comments.push(
           { id: uid('cmt_'), project_id: p.id, folio_id: folios[2].id, target_type: 'shape', target_id: null, author: '张老师', body: '虫孔群边缘有旧补纸残留，先做纤维分析。', resolved: false, created_at: now() },
           { id: uid('cmt_'), project_id: p.id, folio_id: null, target_type: 'project', target_id: null, author: '李修复', body: '同意。注意可逆性。', resolved: false, created_at: now() }
@@ -232,6 +267,8 @@ function createMockApi(): GujiApi {
         asyncify(Object.assign(db.projects.find((x: Row) => x.id === id)!, patch, { updated_at: now() })),
       remove: async (id) => {
         db.projects = db.projects.filter((x: Row) => x.id !== id);
+        // 项目删除：移除该项目的领用/退料流水与批次关联（批次本身是全局资源，仍保留）
+        db.stockMovements = db.stockMovements.filter((m: Row) => m.project_id !== id);
         return asyncify(undefined as any);
       },
       stats: async (id) =>
@@ -392,6 +429,10 @@ function createMockApi(): GujiApi {
       update: async (id, patch) =>
         asyncify(Object.assign(db.materials.find((m: Row) => m.id === id)!, patch, { updated_at: now() })),
       remove: async (id) => {
+        // 与 SQLite 外键 RESTRICT 一致：被批次引用的材料不能直接删除
+        if (db.batches.some((b: Row) => b.material_id === id)) {
+          throw new Error('该材料已有入库批次，请先处理批次后再删除');
+        }
         db.materials = db.materials.filter((m: Row) => m.id !== id);
         return asyncify(undefined as any);
       },
@@ -428,9 +469,169 @@ function createMockApi(): GujiApi {
       remove: async (id) => {
         const s = db.steps.find((x: Row) => x.id === id);
         db.steps = db.steps.filter((s: Row) => s.id !== id);
+        // 全局流水保留以可追溯，但把工序引用置空（整卷领用），避免悬空 step_id
+        for (const m of db.stockMovements) if (m.step_id === id) m.step_id = null;
         touchProject(s?.project_id);
         return asyncify(undefined as any);
       }
+    },
+
+    inventory: {
+      batches: async (materialId) =>
+        asyncify(
+          (materialId
+            ? db.batches.filter((b: Row) => b.material_id === materialId)
+            : db.batches
+          ).map((b: Row) => {
+            let issued = 0;
+            let returned = 0;
+            for (const m of db.stockMovements) {
+              if (m.batch_id !== b.id) continue;
+              if (m.kind === 'issue') issued += m.qty;
+              else if (m.kind === 'return') returned += m.qty;
+            }
+            const mat = db.materials.find((x: Row) => x.id === b.material_id);
+            return {
+              ...b,
+              remaining_qty: batchRemaining(b as MaterialBatch, db.stockMovements as StockMovement[]),
+              issued_total: roundQty(issued),
+              returned_total: roundQty(returned),
+              material_name: mat?.name ?? '(已删除材料)',
+              material_category: mat?.category ?? 'other'
+            };
+          })
+        ),
+      batchDetail: async (batchId) =>
+        asyncify(
+          (() => {
+            const b = db.batches.find((x: Row) => x.id === batchId) as MaterialBatch | undefined;
+            if (!b) throw new Error(`批次不存在: ${batchId}`);
+            const moves = db.stockMovements.filter((m: Row) => m.batch_id === batchId) as StockMovement[];
+            const mat = db.materials.find((x: Row) => x.id === b.material_id) ?? null;
+            // 关联工序：按净领用聚合并用内存项目库补工序标题
+            const net = new Map<string, number>();
+            for (const m of moves) {
+              if (!m.step_id) continue;
+              net.set(m.step_id, (net.get(m.step_id) ?? 0) + (m.kind === 'issue' ? m.qty : -m.qty));
+            }
+            const linked_steps = [...net.entries()]
+              .map(([stepId, qty]) => {
+                const step = db.steps.find((s: Row) => s.id === stepId);
+                const project = step && db.projects.find((p: Row) => p.id === step.project_id);
+                return step
+                  ? {
+                      step_id: stepId,
+                      project_id: step.project_id,
+                      project_name: project?.name ?? '',
+                      title: step.title,
+                      order_index: step.order_index,
+                      qty: roundQty(qty)
+                    }
+                  : null;
+              })
+              .filter((x): x is NonNullable<typeof x> => x !== null)
+              .sort((a, z) => a.order_index - z.order_index);
+            return {
+              batch: b,
+              material: mat,
+              remaining_qty: batchRemaining(b, moves),
+              ledger: batchLedger(b, moves),
+              linked_steps
+            };
+          })()
+        ),
+      createBatch: async (input) =>
+        asyncify((() => {
+          const mat = db.materials.find((x: Row) => x.id === input.material_id);
+          if (!mat) throw new Error(`材料不存在: ${input.material_id}`);
+          const qty = Number(input.initial_qty);
+          if (!Number.isFinite(qty) || qty <= 0) throw new Error('入库数量必须大于 0');
+          const no = (input.batch_no || '').trim();
+          if (!no) throw new Error('请填写批次号');
+          const unit = (input.unit || '').trim();
+          if (!unit) throw new Error('请填写计量单位');
+          if (db.batches.some((b: Row) => b.material_id === input.material_id && b.batch_no.trim().toLocaleLowerCase() === no.toLocaleLowerCase())) {
+            throw new Error(`该材料已存在批次号「${no}」`);
+          }
+          const b = {
+            id: uid('bat_'), material_id: input.material_id, batch_no: no, unit,
+            initial_qty: roundQty(qty), supplier_lot: input.supplier_lot?.trim() ?? '',
+            received_at: /^\d{4}-\d{2}-\d{2}$/.test(input.received_at) ? `${input.received_at}T00:00:00.000Z` : input.received_at,
+            note: input.note?.trim() ?? '', created_at: now()
+          };
+          db.batches.push(b);
+          return b;
+        })()),
+      updateBatch: async (id, patch) =>
+        asyncify(Object.assign(db.batches.find((b: Row) => b.id === id)!, patch)),
+      removeBatch: async (id) => {
+        if (!db.batches.some((b: Row) => b.id === id)) throw new Error(`批次不存在: ${id}`);
+        if (db.stockMovements.some((m: Row) => m.batch_id === id)) {
+          throw new Error('该批次已有领用或退料记录，不能删除（台账只追加、保持可追溯）');
+        }
+        db.batches = db.batches.filter((b: Row) => b.id !== id);
+        return asyncify(undefined as any);
+      },
+      issue: async (input) =>
+        asyncify((() => {
+          const b = db.batches.find((x: Row) => x.id === input.batch_id);
+          if (!b) throw new Error(`批次不存在: ${input.batch_id}`);
+          if (!input.project_id) throw new Error('领料必须指定项目');
+          if (input.step_id && !db.steps.some((s: Row) => s.id === input.step_id && s.project_id === input.project_id)) {
+            throw new Error('工序不存在或不属于当前项目');
+          }
+          const qty = Number(input.qty);
+          const err = checkIssue(b, db.stockMovements, qty);
+          if (err) throw new Error(err);
+          const m = makeMovement({
+            id: uid('mv_'), batch_id: b.id, kind: 'issue', qty,
+            project_id: input.project_id, step_id: input.step_id ?? null,
+            operator: input.operator || '修复师', moved_at: input.moved_at,
+            note: input.note ?? '', created_at: now()
+          });
+          db.stockMovements.push(m);
+          touchProject(input.project_id);
+          return m;
+        })()),
+      returnToStock: async (input) =>
+        asyncify((() => {
+          const source = db.stockMovements.find((m: Row) => m.id === input.source_move_id);
+          if (!source || source.kind !== 'issue') throw new Error('只能针对领料记录退料');
+          const b = db.batches.find((x: Row) => x.id === source.batch_id);
+          if (!b) throw new Error(`批次不存在: ${source.batch_id}`);
+          const qty = Number(input.qty);
+          const err = checkReturn(source, db.stockMovements, qty, b.unit);
+          if (err) throw new Error(err);
+          const m = makeMovement({
+            id: uid('mv_'), batch_id: source.batch_id, kind: 'return', qty,
+            project_id: source.project_id, step_id: source.step_id,
+            operator: input.operator || '修复师', moved_at: input.moved_at,
+            note: input.note ?? '', related_move_id: source.id, created_at: now()
+          });
+          db.stockMovements.push(m);
+          touchProject(source.project_id);
+          return m;
+        })()),
+      stepIssues: async (stepId) =>
+        asyncify(
+          db.stockMovements
+            .filter((m: Row) => m.kind === 'issue' && m.step_id === stepId)
+            .map((moveRow: Row) => {
+              const move = moveRow as StockMovement;
+              const all = db.stockMovements as StockMovement[];
+              const b = (db.batches.find((x: Row) => x.id === move.batch_id) ?? null) as MaterialBatch | null;
+              const mat = b ? db.materials.find((x: Row) => x.id === b.material_id) ?? null : null;
+              return {
+                move,
+                batch: b,
+                material: mat,
+                returned_qty: roundQty(move.qty - issueOutstanding(move, all)),
+                outstanding_qty: issueOutstanding(move, all)
+              };
+            })
+        ),
+      projectMovements: async (pid) =>
+        asyncify(db.stockMovements.filter((m: Row) => m.project_id === pid))
     },
 
     versions: {

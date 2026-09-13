@@ -354,6 +354,98 @@ describe('主进程工作流（SQLite + sharp + zip）', () => {
     expect(withFailure[0].checksum_summary).toBeNull();
   }, 30_000);
 
+  it('材料领用：登记批次 → 工序领料 → 部分退料 → 流水/余量/关联工序可追溯', async () => {
+    const s = await loadServices();
+    const root = mkdtempSync(join(tmpdir(), 'guji-inv-'));
+    const ctx = new s.ServiceContext(root);
+    const project = s.createProject(ctx, {
+      name: '领用测试卷', author: '修复员', shelf_no: 'IV-1', era: '当代', description: ''
+    });
+
+    // 材料 + 批次（计量单位：张，入库 50）
+    const mat = s.createMaterial(ctx, {
+      name: '净皮棉连', category: 'xuan', color_hex: '#efe6cf', lab: null,
+      fiber: '青檀皮', thickness_mm: 0.08, weight_gsm: 22, weave: '', ph: 7.4,
+      supplier: '泾县', note: ''
+    });
+    const batch = s.createBatch(ctx, {
+      material_id: mat.id, batch_no: '2026-A-01', unit: '张', initial_qty: 50,
+      supplier_lot: '批号 2603', received_at: '2026-09-01', note: ''
+    });
+    expect(batch.initial_qty).toBe(50);
+    // 批次号重复报错
+    expect(() =>
+      s.createBatch(ctx, { material_id: mat.id, batch_no: '2026-a-01', unit: '张', initial_qty: 1, received_at: '2026-09-01' })
+    ).toThrow(/已存在批次号/);
+    // 入库数量非法
+    expect(() =>
+      s.createBatch(ctx, { material_id: mat.id, batch_no: 'X', unit: '张', initial_qty: 0, received_at: '2026-09-01' })
+    ).toThrow(/入库数量/);
+
+    // 工序：虫孔嵌补
+    const step = s.createStep(ctx, {
+      project_id: project.id, folio_id: null, order_index: 1, title: '虫孔嵌补',
+      technique: '补洞', material_ids: [mat.id], operator: '修复员',
+      performed_at: '2026-09-03', duration_min: 90, photo_rel: null, note: ''
+    });
+
+    // 领料 10 张，关联到该工序
+    const issue = s.issueMaterial(ctx, {
+      batch_id: batch.id, project_id: project.id, step_id: step.id, qty: 10,
+      operator: '修复员', moved_at: '2026-09-03', note: '虫孔群嵌补'
+    });
+    expect(issue.kind).toBe('issue');
+    expect(s.listBatches(ctx, mat.id)[0].remaining_qty).toBe(40);
+
+    // 超余量领料被拒绝
+    expect(() =>
+      s.issueMaterial(ctx, { batch_id: batch.id, project_id: project.id, step_id: step.id, qty: 41, operator: '', moved_at: '2026-09-03' })
+    ).toThrow(/剩余不足/);
+
+    // 部分退料 4 张 → 余量 44，该次领料未退 6
+    s.returnMaterial(ctx, { source_move_id: issue.id, qty: 4, operator: '修复员', moved_at: '2026-09-04', note: '裁切余料' });
+    expect(s.listBatches(ctx, mat.id)[0].remaining_qty).toBe(44);
+    const rows = s.listStepIssues(ctx, step.id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].returned_qty).toBe(4);
+    expect(rows[0].outstanding_qty).toBe(6);
+    // 超退被拒绝（未退仅 6）
+    expect(() =>
+      s.returnMaterial(ctx, { source_move_id: issue.id, qty: 7, operator: '', moved_at: '2026-09-04' })
+    ).toThrow(/超过/);
+
+    // 批次详情：含合成入库行、领料、退料三段流水；关联工序列出净领用
+    const detail = s.getBatchDetail(ctx, batch.id);
+    expect(detail.remaining_qty).toBe(44);
+    expect(detail.ledger.map((m) => m.kind)).toEqual(['in', 'issue', 'return']);
+    expect(detail.linked_steps).toHaveLength(1);
+    expect(detail.linked_steps[0].title).toBe('虫孔嵌补');
+    expect(detail.linked_steps[0].qty).toBe(6);
+    // 项目维度流水
+    expect(s.listProjectMovements(ctx, project.id).map((m) => m.kind).sort()).toEqual(['issue', 'return']);
+
+    // 有流水的批次不能删除；未领用的新批次可删除
+    expect(() => s.removeBatch(ctx, batch.id)).toThrow(/不能删除/);
+    const emptyBatch = s.createBatch(ctx, {
+      material_id: mat.id, batch_no: '2026-Z-99', unit: '张', initial_qty: 5, received_at: '2026-09-05'
+    });
+    s.removeBatch(ctx, emptyBatch.id);
+    expect(s.listBatches(ctx, mat.id).some((b) => b.id === emptyBatch.id)).toBe(false);
+    // 被批次引用的材料不能删除
+    expect(() => s.removeMaterial(ctx, mat.id)).toThrow(/入库批次/);
+
+    // 删除工序：流水保留但解绑工序（转整卷领用），余量不回滚
+    s.removeStep(ctx, step.id);
+    expect(s.listStepIssues(ctx, step.id)).toHaveLength(0);
+    const afterStep = s.getBatchDetail(ctx, batch.id);
+    expect(afterStep.ledger.filter((m) => m.kind === 'issue')[0].step_id).toBeNull();
+    expect(s.listBatches(ctx, mat.id)[0].remaining_qty).toBe(44);
+
+    // 删除项目：该项目流水移除、批次余量回滚到入库 50
+    s.removeProject(ctx, project.id);
+    expect(s.listBatches(ctx, mat.id)[0].remaining_qty).toBe(50);
+  }, 20_000);
+
   it('空项目导出被阻止并给出可读原因', async () => {
     const s = await loadServices();
     const root = mkdtempSync(join(tmpdir(), 'guji-empty-'));

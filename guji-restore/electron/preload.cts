@@ -22,6 +22,7 @@ contextBridge.exposeInMainWorld('guji', {
   samples: ns('samples'),
   materials: ns('materials'),
   steps: ns('steps'),
+  inventory: ns('inventory'),
   versions: ns('versions'),
   comments: ns('comments'),
   archive: ns('archive'),

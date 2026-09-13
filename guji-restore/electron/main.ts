@@ -139,6 +139,16 @@ function registerIpc(): void {
     'steps.update': (id, patch) => svc.updateStep(ctx, id, patch),
     'steps.remove': (id) => svc.removeStep(ctx, id),
 
+    'inventory.batches': (materialId) => svc.listBatches(ctx, materialId),
+    'inventory.batchDetail': (batchId) => svc.getBatchDetail(ctx, batchId),
+    'inventory.createBatch': (input) => svc.createBatch(ctx, input),
+    'inventory.updateBatch': (id, patch) => svc.updateBatch(ctx, id, patch),
+    'inventory.removeBatch': (id) => svc.removeBatch(ctx, id),
+    'inventory.issue': (input) => svc.issueMaterial(ctx, input),
+    'inventory.returnToStock': (input) => svc.returnMaterial(ctx, input),
+    'inventory.stepIssues': (stepId) => svc.listStepIssues(ctx, stepId),
+    'inventory.projectMovements': (projectId) => svc.listProjectMovements(ctx, projectId),
+
     'versions.list': (folioId) => svc.listVersions(ctx, folioId),
     'versions.save': (folioId, input) => svc.saveVersion(ctx, folioId, input),
     'versions.restore': (versionId, author) => svc.restoreVersion(ctx, versionId, author),

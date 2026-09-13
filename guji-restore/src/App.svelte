@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { api, isElectron } from './lib/api';
   import {
+    batches,
     busy,
     comments,
     currentFolioId,
@@ -15,6 +16,7 @@
     samples,
     shapes,
     steps,
+    stepIssuesMap,
     type ViewKey
   } from './lib/stores';
   import { guard, toast } from './lib/toast';
@@ -25,6 +27,7 @@
   import SamplesView from './views/SamplesView.svelte';
   import MaterialsView from './views/MaterialsView.svelte';
   import StepsView from './views/StepsView.svelte';
+  import InventoryView from './views/InventoryView.svelte';
   import CompareView from './views/CompareView.svelte';
   import ArchiveView from './views/ArchiveView.svelte';
   import DashboardView from './views/DashboardView.svelte';
@@ -42,6 +45,7 @@
     { key: 'annotate', label: '扫描标注' },
     { key: 'samples', label: '纸墨样本' },
     { key: 'materials', label: '材料推荐' },
+    { key: 'inventory', label: '材料领用' },
     { key: 'steps', label: '修复工序' },
     { key: 'compare', label: '前后对比' },
     { key: 'archive', label: '修复档案' }
@@ -60,12 +64,13 @@
   let loadToken = 0;
   async function loadProjectData(pid: string) {
     const myToken = ++loadToken;
-    const [fl, sm, ms, st, cm] = await Promise.all([
+    const [fl, sm, ms, st, cm, ba] = await Promise.all([
       api.folios.list(pid),
       api.samples.list(),
       api.materials.list(),
       api.steps.list(pid),
-      api.comments.list(pid)
+      api.comments.list(pid),
+      api.inventory.batches()
     ]);
     if (myToken !== loadToken) return;
     folios.set(fl);
@@ -73,6 +78,15 @@
     materials.set(ms);
     steps.set(st);
     comments.set(cm);
+    batches.set(ba);
+    // 逐道工序加载领料批次（数量少，直接并行；失败不阻塞主流程）
+    const issueEntries = await Promise.all(
+      st.map(async (s) => [s.id, await api.inventory.stepIssues(s.id)] as const)
+    );
+    if (myToken !== loadToken) return;
+    const issueMap: Record<string, any> = {};
+    for (const [sid, rows] of issueEntries) issueMap[sid] = rows;
+    stepIssuesMap.set(issueMap);
     const firstFolio = fl[0]?.id ?? null;
     currentFolioId.set(firstFolio);
     if (!firstFolio) {
@@ -173,6 +187,8 @@
         <MaterialsView />
       {:else if $currentView === 'steps'}
         <StepsView />
+      {:else if $currentView === 'inventory'}
+        <InventoryView />
       {:else if $currentView === 'compare'}
         <CompareView />
       {:else if $currentView === 'dashboard'}

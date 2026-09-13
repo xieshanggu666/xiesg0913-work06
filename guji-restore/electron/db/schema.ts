@@ -6,7 +6,7 @@ import { join } from 'node:path';
 /**
  * 存储布局（应用数据目录，全部离线、本机）：
  *   guji-data/
- *     library.db                     全局库：项目索引、全局样本、材料
+ *     library.db                     全局库：项目索引、全局样本、材料、批次、领用流水
  *     projects/<id>/project.db       项目库：叶、图层、标注、工序、版本、批注
  *     projects/<id>/original/<file>  原图只读副本
  *     projects/<id>/thumb/<file>     sharp 生成的缩略图
@@ -95,6 +95,38 @@ CREATE TABLE IF NOT EXISTS materials (
   updated_at   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_materials_category ON materials(category);
+
+-- 材料领用（批次追溯）：批次与流水均在全局库，可跨项目领用。
+-- step_id 指向某项目库 steps 表（跨库不建物理外键，删除工序时由服务层置空/核对）。
+CREATE TABLE IF NOT EXISTS material_batches (
+  id           TEXT PRIMARY KEY,
+  material_id  TEXT NOT NULL REFERENCES materials(id) ON DELETE RESTRICT,
+  batch_no     TEXT NOT NULL,             -- 批次号
+  unit         TEXT NOT NULL DEFAULT '',  -- 计量单位：张 / cm / g …
+  initial_qty  REAL NOT NULL DEFAULT 0,   -- 入库数量（>0）
+  supplier_lot TEXT NOT NULL DEFAULT '',  -- 供应商批号 / 来源说明
+  received_at  TEXT NOT NULL,             -- 入库日期
+  note         TEXT NOT NULL DEFAULT '',
+  created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_batches_material ON material_batches(material_id);
+
+CREATE TABLE IF NOT EXISTS stock_movements (
+  id             TEXT PRIMARY KEY,
+  batch_id       TEXT NOT NULL REFERENCES material_batches(id) ON DELETE RESTRICT,
+  kind           TEXT NOT NULL,           -- issue（领料）| return（退料）；入库由批次合成
+  qty            REAL NOT NULL,           -- 始终为正数，方向由 kind 表达
+  project_id     TEXT,                    -- 领用/退料所属项目；可空
+  step_id        TEXT,                    -- 关联工序；可空（整卷领用）
+  operator       TEXT NOT NULL DEFAULT '',
+  moved_at       TEXT NOT NULL,
+  note           TEXT NOT NULL DEFAULT '',
+  related_move_id TEXT,                   -- 退料指向原领料流水
+  created_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_moves_batch ON stock_movements(batch_id, moved_at);
+CREATE INDEX IF NOT EXISTS idx_moves_project ON stock_movements(project_id);
+CREATE INDEX IF NOT EXISTS idx_moves_step ON stock_movements(step_id);
 `;
 
 const PROJECT_SCHEMA = `

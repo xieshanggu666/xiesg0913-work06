@@ -99,7 +99,67 @@ export async function importSampleProject(
 
   const materials = repo.listMaterials(lib);
   seedDemoData(db, project.id, folios, materials, operator);
+  seedDemoInventory(lib, project.id, db, materials, operator, now);
   return { projectId: project.id, folioCount: folios.length };
+}
+
+/**
+ * 样例库存：为“净皮棉连 / 仿古色棉连”各登记一个批次，
+ * 并让第三道工序（虫孔嵌补）从净皮棉连批次领料，演示选材→批次→工序追溯。
+ */
+function seedDemoInventory(
+  lib: DBType,
+  projectId: ID,
+  projectDb: DBType,
+  materials: Material[],
+  operator: string,
+  now: string
+): void {
+  if ((lib.prepare('SELECT COUNT(*) AS n FROM material_batches').get() as any).n > 0) return;
+  const mian = materials.find((m) => m.name === '净皮棉连');
+  const fanggu = materials.find((m) => m.name === '仿古色棉连');
+  const day = now.slice(0, 10);
+
+  const addBatch = (material: Material | undefined, batchNo: string, qty: number, lot: string) => {
+    if (!material) return null;
+    const batch = {
+      id: newId('bat_'),
+      material_id: material.id,
+      batch_no: batchNo,
+      unit: '张',
+      initial_qty: qty,
+      supplier_lot: lot,
+      received_at: `${day}T00:00:00.000Z`,
+      note: '内置示例批次',
+      created_at: now
+    };
+    repo.insertBatch(lib, batch);
+    return batch;
+  };
+
+  const mianBatch = addBatch(mian, '2026-A-01', 50, '泾县宣纸厂 / 入厂批号 2603');
+  addBatch(fanggu, '2026-B-07', 30, '泾县宣纸厂 / 入厂批号 2608');
+  if (!mianBatch) return;
+
+  // 样例第三道工序“虫孔嵌补”领料 6 张
+  const step = projectDb
+    .prepare("SELECT id FROM steps WHERE project_id = ? AND title = '虫孔嵌补'")
+    .get(projectId) as { id: string } | undefined;
+  if (step) {
+    repo.insertMovement(lib, {
+      id: newId('mv_'),
+      batch_id: mianBatch.id,
+      kind: 'issue',
+      qty: 6,
+      project_id: projectId,
+      step_id: step.id,
+      operator,
+      moved_at: `${day}T00:00:00.000Z`,
+      note: '虫孔群嵌补领纸',
+      related_move_id: null,
+      created_at: now
+    });
+  }
 }
 
 /** 直接建默认三层 + 基线版本（与 services.importFolios 行为一致，样例直接走底层避免循环） */

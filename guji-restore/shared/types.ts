@@ -160,6 +160,44 @@ export interface RestorationStep {
   created_at: string;
 }
 
+/* ---------------- 材料领用（批次追溯） ---------------- */
+
+/** 批次流水类型：入库 / 领料出库 / 退料入库；流水只追加、不修改、不删除 */
+export type StockMoveKind = 'in' | 'issue' | 'return';
+
+/** 材料入库批次：登记批次号、计量单位与入库数量，库存可跨项目领用 */
+export interface MaterialBatch {
+  id: ID;
+  material_id: ID; // 关联材料库材料
+  batch_no: string; // 批次号
+  unit: string; // 计量单位，如“张 / cm / g”
+  initial_qty: number; // 入库数量（>0）
+  supplier_lot: string; // 供应商批号 / 来源说明
+  received_at: string; // 入库日期（ISO）
+  note: string;
+  created_at: string;
+}
+
+/**
+ * 批次流水（只追加台账）。
+ *  - in     入库（建批次时产生一条，project_id 为 null）
+ *  - issue  领料出库，关联具体项目与工序，qty 为正，按批次余量扣减
+ *  - return 退料入库，必须源于某条 issue，qty 为正，不能超过该次领料未退数量
+ */
+export interface StockMovement {
+  id: ID;
+  batch_id: ID;
+  kind: StockMoveKind;
+  qty: number; // 始终为正数；方向由 kind 决定
+  project_id: ID | null; // 入库为 null；领用/退料为项目 ID
+  step_id: ID | null; // 关联工序（可空 = 整卷领用）
+  operator: string;
+  moved_at: string; // 实际领用/退料/入库时间
+  note: string;
+  related_move_id: ID | null; // 退料指向原领料流水
+  created_at: string;
+}
+
 /** 方案版本快照内容 */
 export interface PlanSnapshot {
   layers: Layer[];

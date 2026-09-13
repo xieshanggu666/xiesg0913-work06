@@ -1,6 +1,6 @@
 <script lang="ts">
   import { api } from '../lib/api';
-  import { materials, recommendSampleId, samples } from '../lib/stores';
+  import { batches, currentView, inventoryMaterialFilter, inventoryPrefillMaterial, materials, recommendSampleId, samples } from '../lib/stores';
   import { guard, toast } from '../lib/toast';
   import { MATERIAL_CATEGORIES, MATERIAL_CATEGORY_META } from '@shared/constants';
   import { applyLibraryQuery, type LibrarySortKey } from '@shared/list-query';
@@ -55,9 +55,32 @@
     }
   }
   async function remove(id: string) {
-    if (!confirm('删除该材料？已被工序引用时仅不影响历史记录文本。')) return;
-    await guard(api.materials.remove(id), '删除失败');
-    materials.set(await api.materials.list());
+    if (!confirm('删除该材料？已被批次引用的材料不能删除；其它历史引用仅保留文本。')) return;
+    const r = await guard(api.materials.remove(id), '删除失败');
+    if (r === undefined) {
+      materials.set(await api.materials.list());
+      toast('材料已删除');
+    }
+  }
+
+  function batchCount(materialId: string): number {
+    return $batches.filter((b) => b.material_id === materialId).length;
+  }
+  function stockRemaining(materialId: string): number {
+    return $batches
+      .filter((b) => b.material_id === materialId)
+      .reduce((sum, b) => sum + b.remaining_qty, 0);
+  }
+  /** 跳到材料领用页并只看该材料的批次 */
+  function viewBatches(materialId: string) {
+    inventoryMaterialFilter.set(materialId);
+    currentView.set('inventory');
+  }
+  /** 带入预选材料，直接打开“登记批次”弹窗 */
+  function registerBatch(materialId: string) {
+    inventoryMaterialFilter.set(materialId);
+    inventoryPrefillMaterial.set(materialId);
+    currentView.set('inventory');
   }
 
   async function runRecommend(sampleId: string) {
@@ -161,7 +184,17 @@
         </div>
         <p>{m.fiber}</p>
         <p class="muted">{m.weave}{m.ph != null ? `　pH ${m.ph}` : ''}</p>
+        <p class="stock">
+          {#if batchCount(m.id) > 0}
+            <button class="link" on:click={() => viewBatches(m.id)} title="查看该材料的批次与余量">
+              {batchCount(m.id)} 个批次 · 总余量 {stockRemaining(m.id)}
+            </button>
+          {:else}
+            <span class="muted">尚未登记批次</span>
+          {/if}
+        </p>
         <div class="row">
+          <button class="btn tiny ghost" on:click={() => registerBatch(m.id)}>登记批次</button>
           <button class="btn tiny ghost" on:click={() => (editing = { ...m, thickness_mm: m.thickness_mm ?? '', weight_gsm: m.weight_gsm ?? '', ph: m.ph ?? '' })}>编辑</button>
           <button class="btn tiny ghost" on:click={() => remove(m.id)}>删除</button>
         </div>
@@ -356,6 +389,20 @@
     display: flex;
     gap: 6px;
     margin-top: 10px;
+    flex-wrap: wrap;
+  }
+  .stock {
+    margin-top: 6px;
+    font-size: 12px;
+  }
+  .stock .link {
+    border: none;
+    background: none;
+    color: var(--accent);
+    cursor: pointer;
+    font-size: inherit;
+    padding: 0;
+    text-decoration: underline;
   }
   .two {
     display: grid;

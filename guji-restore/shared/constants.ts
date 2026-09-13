@@ -1,4 +1,4 @@
-import type { DamageKind, MaterialCategory } from './types.js';
+import type { DamageKind, MaterialCategory, StockMoveKind } from './types.js';
 
 /** 破损类型 → 中文标注与默认配色 */
 export const DAMAGE_META: Record<DamageKind, { label: string; color: string }> = {
@@ -53,6 +53,16 @@ export const TECHNIQUES = [
 ] as const;
 
 export const ABSORBENCY_LEVELS = ['低', '中', '高'] as const;
+
+/** 材料批次常用计量单位，供界面下拉；仍允许手填其它单位 */
+export const STOCK_UNITS = ['张', 'cm', 'cm²', 'g', 'kg', '卷', '瓶', '块'] as const;
+
+/** 批次流水类型 → 中文标签与配色（入库/领料/退料） */
+export const STOCK_MOVE_META: Record<StockMoveKind, { label: string; color: string }> = {
+  in: { label: '入库', color: '#2b8a3e' },
+  issue: { label: '领料', color: '#1971c2' },
+  return: { label: '退料', color: '#b08900' }
+};
 
 /** 每叶标注数据在版本快照里的初始版本号 */
 export const INITIAL_PLAN_VERSION = 1;

@@ -10,6 +10,7 @@ import type {
   ID,
   Layer,
   Material,
+  MaterialBatch,
   PlanSnapshot,
   PlanVersion,
   Project,
@@ -17,7 +18,8 @@ import type {
   RestorationStep,
   Sample,
   SampleKind,
-  Shape
+  Shape,
+  StockMovement
 } from '@shared/types';
 import type { DamageKind, LayerKind, MaterialCategory } from '@shared/types';
 import { newId, nowIso } from '@shared/id';
@@ -26,6 +28,24 @@ import { hexToLab } from '@shared/color';
 import { recommendMaterials } from '@shared/recommend';
 import { buildDashboard, type DashboardReport } from '@shared/dashboard';
 import { INITIAL_PLAN_VERSION, LAYER_KIND_META } from '@shared/constants';
+import {
+  batchLedger,
+  batchRemaining,
+  checkIssue,
+  checkReturn,
+  issueOutstanding,
+  makeMovement,
+  roundQty
+} from '@shared/inventory';
+import type {
+  BatchDetail,
+  BatchLinkedStep,
+  IssueInput,
+  MaterialBatchWithQty,
+  NewBatchInput,
+  ReturnInput,
+  StepIssueRow
+} from '@shared/protocol';
 import { openLibrary, openProject } from '../db/schema';
 import * as repo from '../db/repo';
 import { averageColorHex, importAfterImage, importOriginal } from './images';
@@ -85,6 +105,8 @@ export function updateProject(ctx: ServiceContext, id: ID, patch: Partial<Projec
 }
 
 export function removeProject(ctx: ServiceContext, id: ID): void {
+  // 先清理全局库存中该项目的领用/退料流水并回滚批次余量，再删项目目录
+  repo.deleteMovementsByProject(ctx.library(), id);
   repo.deleteProjectRow(ctx.library(), id);
   ctx.disposeProject(id);
 }
@@ -404,6 +426,12 @@ export function updateMaterial(ctx: ServiceContext, id: ID, patch: Partial<Mater
 }
 
 export function removeMaterial(ctx: ServiceContext, id: ID): void {
+  // 被批次引用的材料不能删除（外键 ON DELETE RESTRICT），给出可读原因
+  const used = ctx
+    .library()
+    .prepare('SELECT COUNT(*) AS n FROM material_batches WHERE material_id = ?')
+    .get(id) as any;
+  if ((used.n as number) > 0) throw new Error('该材料已有入库批次，请先处理批次后再删除');
   repo.deleteMaterialRow(ctx.library(), id);
 }
 
@@ -449,11 +477,239 @@ export function removeStep(ctx: ServiceContext, id: ID): void {
     const hit = db.prepare('SELECT 1 FROM steps WHERE id = ?').get(id);
     if (hit) {
       repo.deleteStepRow(db, id);
+      // 领料流水保留可追溯，但解除工序引用（转为整卷领用），避免悬空 step_id
+      repo.detachMovementsFromStep(ctx.library(), id);
       touchProject(ctx, p.id);
       return;
     }
   }
 }
+
+/* ---------------- 材料领用（批次追溯） ---------------- */
+
+/** 批次/流水存全局库；工序按项目分库，这里只追加全局流水，不改项目库 */
+
+export function listBatches(ctx: ServiceContext, materialId?: ID): MaterialBatchWithQty[] {
+  const lib = ctx.library();
+  const materials = repo.listMaterials(lib);
+  const matById = new Map(materials.map((m) => [m.id, m]));
+  const moves = repo.listMovements(lib);
+  return repo.listBatches(lib, materialId).map((b) => {
+    let issued = 0;
+    let returned = 0;
+    for (const m of moves) {
+      if (m.batch_id !== b.id) continue;
+      if (m.kind === 'issue') issued += m.qty;
+      else if (m.kind === 'return') returned += m.qty;
+    }
+    const mat = matById.get(b.material_id);
+    return {
+      ...b,
+      remaining_qty: batchRemaining(b, moves),
+      issued_total: roundQty(issued),
+      returned_total: roundQty(returned),
+      material_name: mat?.name ?? '(已删除材料)',
+      material_category: mat?.category ?? 'other'
+    };
+  });
+}
+
+export function getBatchDetail(ctx: ServiceContext, batchId: ID): BatchDetail {
+  const lib = ctx.library();
+  const batch = repo.getBatch(lib, batchId);
+  if (!batch) throw new Error(`批次不存在: ${batchId}`);
+  const moves = repo.listMovements(lib).filter((m) => m.batch_id === batchId);
+  const material = repo.getMaterial(lib, batch.material_id);
+  const linked = buildLinkedSteps(ctx, moves);
+  return {
+    batch,
+    material,
+    remaining_qty: batchRemaining(batch, moves),
+    ledger: batchLedger(batch, moves),
+    linked_steps: linked
+  };
+}
+
+/** 汇总批次被哪些工序领用（按项目分库查工序标题） */
+function buildLinkedSteps(ctx: ServiceContext, moves: StockMovement[]): BatchLinkedStep[] {
+  // stepId → 净领用数量（领料 - 退料）
+  const net = new Map<ID, number>();
+  for (const m of moves) {
+    if (m.kind !== 'issue' || !m.step_id) continue;
+    net.set(m.step_id, (net.get(m.step_id) ?? 0) + m.qty);
+  }
+  for (const m of moves) {
+    if (m.kind !== 'return' || !m.step_id) continue;
+    net.set(m.step_id, (net.get(m.step_id) ?? 0) - m.qty);
+  }
+  const projects = repo.listProjects(ctx.library());
+  const projectName = new Map(projects.map((p) => [p.id, p.name]));
+  const out: BatchLinkedStep[] = [];
+  for (const p of projects) {
+    const db = ctx.projectDb(p.id);
+    for (const [stepId, qty] of net) {
+      const step = db.prepare('SELECT * FROM steps WHERE id = ?').get(stepId) as any;
+      if (step) {
+        out.push({
+          step_id: stepId,
+          project_id: p.id,
+          project_name: projectName.get(p.id) ?? p.name,
+          title: step.title,
+          order_index: step.order_index,
+          qty: roundQty(qty)
+        });
+      }
+    }
+  }
+  return out.sort((a, b) => a.order_index - b.order_index);
+}
+
+export function createBatch(ctx: ServiceContext, input: NewBatchInput): MaterialBatch {
+  const lib = ctx.library();
+  const material = repo.getMaterial(lib, input.material_id);
+  if (!material) throw new Error(`材料不存在: ${input.material_id}`);
+  const qty = Number(input.initial_qty);
+  if (!Number.isFinite(qty) || qty <= 0) throw new Error('入库数量必须大于 0');
+  const no = input.batch_no.trim();
+  if (!no) throw new Error('请填写批次号');
+  const unit = input.unit.trim();
+  if (!unit) throw new Error('请填写计量单位');
+  const duplicate = repo
+    .listBatches(lib, input.material_id)
+    .some((b) => b.batch_no.trim().toLocaleLowerCase() === no.toLocaleLowerCase());
+  if (duplicate) throw new Error(`该材料已存在批次号「${no}」`);
+  const ts = nowIso();
+  const batch: MaterialBatch = {
+    id: newId('bat_'),
+    material_id: input.material_id,
+    batch_no: no,
+    unit,
+    initial_qty: roundQty(qty),
+    supplier_lot: input.supplier_lot?.trim() ?? '',
+    received_at: input.received_at ? normalizeDate(input.received_at) : ts,
+    note: input.note?.trim() ?? '',
+    created_at: ts
+  };
+  repo.insertBatch(lib, batch);
+  return batch;
+}
+
+export function updateBatch(
+  ctx: ServiceContext,
+  id: ID,
+  patch: Partial<Pick<MaterialBatch, 'batch_no' | 'supplier_lot' | 'received_at' | 'note'>>
+): MaterialBatch {
+  const clean: typeof patch = { ...patch };
+  if (clean.received_at) clean.received_at = normalizeDate(clean.received_at);
+  if (clean.batch_no !== undefined) clean.batch_no = clean.batch_no.trim();
+  return repo.updateBatchRow(ctx.library(), id, clean);
+}
+
+export function removeBatch(ctx: ServiceContext, id: ID): void {
+  const lib = ctx.library();
+  const batch = repo.getBatch(lib, id);
+  if (!batch) throw new Error(`批次不存在: ${id}`);
+  // 有任何领用/退料流水都不允许删除：批次须可追溯到实际使用
+  if (repo.countMovementsOfBatch(lib, id) > 0) {
+    throw new Error('该批次已有领用或退料记录，不能删除（台账只追加、保持可追溯）');
+  }
+  repo.deleteBatchRow(lib, id);
+}
+
+export function issueMaterial(ctx: ServiceContext, input: IssueInput): StockMovement {
+  const lib = ctx.library();
+  const batch = repo.getBatch(lib, input.batch_id);
+  if (!batch) throw new Error(`批次不存在: ${input.batch_id}`);
+  if (!input.project_id) throw new Error('领料必须指定项目');
+  if (input.step_id) assertStepExists(ctx, input.project_id, input.step_id);
+  const qty = Number(input.qty);
+  const all = repo.listMovements(lib);
+  const err = checkIssue(batch, all, qty);
+  if (err) throw new Error(err);
+  const move = makeMovement({
+    id: newId('mv_'),
+    batch_id: batch.id,
+    kind: 'issue',
+    qty,
+    project_id: input.project_id,
+    step_id: input.step_id ?? null,
+    operator: input.operator?.trim() || '修复师',
+    moved_at: normalizeDate(input.moved_at),
+    note: input.note?.trim() ?? '',
+    created_at: nowIso()
+  });
+  repo.insertMovement(lib, move);
+  touchProject(ctx, input.project_id);
+  return move;
+}
+
+export function returnMaterial(ctx: ServiceContext, input: ReturnInput): StockMovement {
+  const lib = ctx.library();
+  const source = repo.getMovement(lib, input.source_move_id);
+  if (!source || source.kind !== 'issue') throw new Error('只能针对领料记录退料');
+  const batch = repo.getBatch(lib, source.batch_id);
+  if (!batch) throw new Error(`批次不存在: ${source.batch_id}`);
+  const qty = Number(input.qty);
+  const all = repo.listMovements(lib);
+  const err = checkReturn(source, all, qty, batch.unit);
+  if (err) throw new Error(err);
+  const move = makeMovement({
+    id: newId('mv_'),
+    batch_id: source.batch_id,
+    kind: 'return',
+    qty,
+    project_id: source.project_id,
+    step_id: source.step_id,
+    operator: input.operator?.trim() || '修复师',
+    moved_at: normalizeDate(input.moved_at),
+    note: input.note?.trim() ?? '',
+    related_move_id: source.id,
+    created_at: nowIso()
+  });
+  repo.insertMovement(lib, move);
+  if (source.project_id) touchProject(ctx, source.project_id);
+  return move;
+}
+
+export function listStepIssues(ctx: ServiceContext, stepId: ID): StepIssueRow[] {
+  const lib = ctx.library();
+  const moves = repo.listMovements(lib).filter((m) => m.kind === 'issue' && m.step_id === stepId);
+  const batches = repo.listBatches(lib);
+  const batchById = new Map(batches.map((b) => [b.id, b]));
+  const materials = repo.listMaterials(lib);
+  const matById = new Map(materials.map((m) => [m.id, m]));
+  const all = repo.listMovements(lib);
+  return moves.map((move) => {
+    const batch = batchById.get(move.batch_id) ?? null;
+    return {
+      move,
+      batch,
+      material: batch ? matById.get(batch.material_id) ?? null : null,
+      returned_qty: roundQty(move.qty - issueOutstanding(move, all)),
+      outstanding_qty: issueOutstanding(move, all)
+    };
+  });
+}
+
+export function listProjectMovements(ctx: ServiceContext, projectId: ID): StockMovement[] {
+  return repo.listMovementsByProject(ctx.library(), projectId);
+}
+
+/** 校验工序确实属于该项目（避免领料挂到别的项目工序上） */
+function assertStepExists(ctx: ServiceContext, projectId: ID, stepId: ID): void {
+  const hit = ctx
+    .projectDb(projectId)
+    .prepare('SELECT 1 FROM steps WHERE id = ? AND project_id = ?')
+    .get(stepId, projectId);
+  if (!hit) throw new Error(`工序不存在或不属于当前项目: ${stepId}`);
+}
+
+/** 表单日期（yyyy-mm-dd 或 ISO）统一为 ISO；已是完整时间则原样返回 */
+function normalizeDate(v: string): string {
+  if (!v) return nowIso();
+  return /^\d{4}-\d{2}-\d{2}$/.test(v) ? `${v}T00:00:00.000Z` : v;
+}
+
 
 /* ---------------- 方案版本 ---------------- */
 
